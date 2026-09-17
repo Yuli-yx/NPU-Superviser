@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NPU 资源看板</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='7' y='7' width='18' height='18' rx='4' fill='%230D9488'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='white'/%3E%3Crect x='13' y='2' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='17' y='2' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='13' y='26' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='17' y='26' width='2' height='4' rx='1' fill='%230D9488'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <rect x="7" y="7" width="18" height="18" rx="4" class="bm-body"/>
+      <rect x="11.5" y="11.5" width="9" height="9" rx="2" class="bm-core"/>
+      <rect x="13" y="2" width="2" height="4" rx="1" class="bm-pin"/>
+      <rect x="17" y="2" width="2" height="4" rx="1" class="bm-pin"/>
+      <rect x="13" y="26" width="2" height="4" rx="1" class="bm-pin"/>
+      <rect x="17" y="26" width="2" height="4" rx="1" class="bm-pin"/>
+      <rect x="2" y="13" width="4" height="2" rx="1" class="bm-pin"/>
+      <rect x="2" y="17" width="4" height="2" rx="1" class="bm-pin"/>
+      <rect x="26" y="13" width="4" height="2" rx="1" class="bm-pin"/>
+      <rect x="26" y="17" width="4" height="2" rx="1" class="bm-pin"/>
+    </svg>
+    <div class="brand-text">
+      <h1>NPU 资源看板</h1>
+      <p>开发组 · 昇腾服务器</p>
+    </div>
+  </div>
+
+  <div class="stats" id="stats" aria-label="资源汇总"></div>
+
+  <div class="refresh" id="refreshBox" title="自动刷新倒计时,点击立即刷新">
+    <svg viewBox="0 0 36 36" class="refresh-ring" aria-hidden="true">
+      <circle class="rr-bg" cx="18" cy="18" r="15.5"/>
+      <circle class="rr-fg" id="refreshArc" cx="18" cy="18" r="15.5"/>
+    </svg>
+    <span class="refresh-label mono" id="refreshSec">10s</span>
+  </div>
+</header>
+
+<div class="toolbar">
+  <div class="filters">
+    <label class="search-box">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" stroke-width="1.6"/><line x1="10.5" y1="10.5" x2="14" y2="14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="fSearch" type="search" placeholder="搜索名称 / IP" autocomplete="off">
+    </label>
+    <select id="fModel" aria-label="按型号筛选"><option value="">全部型号</option></select>
+    <select id="fTag" aria-label="按组网标签筛选"><option value="">全部组网</option></select>
+    <select id="fState" aria-label="按状态筛选">
+      <option value="">全部状态</option>
+      <option value="idle">空闲</option>
+      <option value="occupied">已占用</option>
+      <option value="busy">在跑 · 未登记</option>
+      <option value="offline">离线 / 无数据</option>
+    </select>
+  </div>
+  <div class="actions">
+    <button class="btn ghost" id="btnCollect" title="立即开始一轮采集">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M13.7 1.8v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      立即采集
+    </button>
+    <button class="btn ghost" id="btnBackup" title="导出 / 导入台账备份">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0L5 7m3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11.5v1a1.5 1.5 0 0 0 1.5 1.5h8a1.5 1.5 0 0 0 1.5-1.5v-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      备份
+    </button>
+    <button class="btn ghost" id="btnSettings" title="采集与阈值设置">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      设置
+    </button>
+    <button class="btn primary" id="btnAddServer">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+      添加服务器
+    </button>
+  </div>
+</div>
+
+<div class="legendbar">
+  <span class="legend-item"><i class="dot idle"></i>空闲</span>
+  <span class="legend-item"><i class="dot occupied"></i>已占用</span>
+  <span class="legend-item"><i class="dot busy"></i>在跑 · 未登记</span>
+  <span class="legend-item"><i class="dot offline"></i>离线 / 无数据</span>
+  <span class="legend-hint">点击卡格可登记 / 释放占用</span>
+</div>
+
+<main class="board" id="board"></main>
+
+<!-- 服务器 新增/编辑 -->
+<div class="overlay" id="serverModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="smTitle">
+    <header class="modal-head">
+      <h2 id="smTitle">添加服务器</h2>
+      <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+    </header>
+    <form id="serverForm" class="modal-body">
+      <div class="form-grid">
+        <label class="field"><span>名称 *</span><input name="name" required maxlength="60" placeholder="如 atlas-a3-01"></label>
+        <label class="field"><span>IP *</span><input name="ip" required maxlength="64" placeholder="如 10.24.1.11"></label>
+        <label class="field"><span>SSH 端口</span><input name="ssh_port" type="number" min="1" max="65535" value="22"></label>
+        <label class="field"><span>型号</span>
+          <select name="model" id="smModel"></select>
+        </label>
+        <label class="field"><span>预设卡数</span><input name="expected_cards" type="number" min="0" max="64" value="8" title="仅作台账参考,展示以实际采集为准"></label>
+        <label class="field"><span>SSH 用户名</span><input name="username" value="root"></label>
+        <label class="field"><span>SSH 密码</span><input name="password" type="text" autocomplete="off" placeholder="用于采集与展示"></label>
+        <label class="field span2"><span>组网标签(逗号分隔)</span><input name="tags" placeholder="如: RoCE, 参数面, 训练组"></label>
+        <label class="field span2"><span>备注</span><input name="note" maxlength="200" placeholder="机房位置、负责人等(可选)"></label>
+      </div>
+      <label class="check-field"><input type="checkbox" name="collect_enabled" checked> 启用定时采集</label>
+      <footer class="modal-foot">
+        <button type="button" class="btn ghost" data-close>取消</button>
+        <button type="submit" class="btn primary">保存</button>
+      </footer>
+    </form>
+  </div>
+</div>
+
+<!-- 卡片详情 / 登记占用 -->
+<div class="overlay" id="tileModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tmTitle">
+    <header class="modal-head">
+      <h2 id="tmTitle">NPU 详情</h2>
+      <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+    </header>
+    <div class="modal-body">
+      <div class="metric-grid" id="tmMetrics"></div>
+      <div id="tmOccArea">
+        <h3 class="section-title">占用登记</h3>
+        <div id="tmOccView" class="occ-view" hidden></div>
+        <form id="occForm" class="occ-form" hidden>
+          <label class="field"><span>占用人 *</span><input name="user" required maxlength="40" placeholder="姓名 / 工号"></label>
+          <label class="field"><span>用途</span><input name="purpose" maxlength="120" placeholder="如 llama3 微调"></label>
+          <label class="field"><span>开始时间</span><input name="start" type="datetime-local"></label>
+          <footer class="modal-foot">
+            <button type="button" class="btn ghost" data-close>关闭</button>
+            <button type="submit" class="btn primary">登记占用</button>
+          </footer>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 设置 -->
+<div class="overlay" id="settingsModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <header class="modal-head">
+      <h2 id="setTitle">设置</h2>
+      <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+    </header>
+    <form id="settingsForm" class="modal-body">
+      <h3 class="section-title">采集</h3>
+      <div class="form-grid">
+        <label class="field"><span>采集间隔(秒)</span><input name="interval_seconds" type="number" min="5" max="3600" required></label>
+        <label class="field"><span>并发线程数</span><input name="collect_workers" type="number" min="1" max="32" required></label>
+        <label class="field"><span>SSH 连接超时(秒)</span><input name="ssh_connect_timeout" type="number" min="1" max="60" required></label>
+        <label class="field"><span>SSH 执行超时(秒)</span><input name="ssh_exec_timeout" type="number" min="1" max="120" required></label>
+      </div>
+      <h3 class="section-title">"在跑"判定阈值</h3>
+      <div class="form-grid">
+        <label class="field"><span>AI Core 利用率 ≥ (%)</span><input name="aicore_threshold" type="number" min="0" max="100" required></label>
+        <label class="field"><span>HBM 已用 ≥ (%)</span><input name="hbm_threshold_pct" type="number" min="0" max="100" required></label>
+      </div>
+      <h3 class="section-title">服务器型号<span class="title-hint">新增服务器时的候选,与默认卡数</span></h3>
+      <div id="modelsEditor" class="models-editor"></div>
+      <footer class="modal-foot">
+        <button type="button" class="btn ghost" data-close>取消</button>
+        <button type="submit" class="btn primary">保存设置</button>
+      </footer>
+    </form>
+  </div>
+</div>
+
+<!-- 备份 -->
+<div class="overlay" id="backupModal" hidden>
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="bkTitle">
+    <header class="modal-head">
+      <h2 id="bkTitle">台账备份</h2>
+      <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
+    </header>
+    <div class="modal-body">
+      <p class="bk-desc">导出内容包含服务器台账(含 SSH 密码)、生效中的占用登记与型号配置。JSON 文件请妥善保管。</p>
+      <div class="bk-actions">
+        <button class="btn ghost" id="btnExport">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V3m0 0L5 6m3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          导出 JSON
+        </button>
+        <label class="btn ghost file-btn">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v8m0 0L5 8m3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+          导入 JSON
+          <input type="file" id="importFile" accept=".json,application/json" hidden>
+        </label>
+      </div>
+      <p class="bk-note">导入按「名称」匹配:已存在则更新,不存在则新增;已有生效登记的卡会跳过,不会重复登记。</p>
+    </div>
+  </div>
+</div>
+
+<!-- 确认 -->
+<div class="overlay" id="confirmModal" hidden>
+  <div class="modal narrow" role="alertdialog" aria-modal="true" aria-labelledby="cfText">
+    <div class="modal-body">
+      <p id="cfText" class="cf-text">确定?</p>
+      <footer class="modal-foot">
+        <button class="btn ghost" id="cfCancel">取消</button>
+        <button class="btn danger" id="cfOk">确认</button>
+      </footer>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="tooltip mono" id="tooltip" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
