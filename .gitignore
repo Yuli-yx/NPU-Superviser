@@ -7,6 +7,7 @@ data.db-wal
 .venv/
 __pycache__/
 *.pyc
+logs/
 
 # 临时截图
 shot-*.png

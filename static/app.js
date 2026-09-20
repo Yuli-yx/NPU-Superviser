@@ -4,18 +4,23 @@
 const $ = (sel, root) => (root || document).querySelector(sel);
 const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 
-const REFRESH_SECS = 10;
-const RING_C = 2 * Math.PI * 15.5; // 刷新环周长
+const REFRESH_SECS = 30 * 60;
 
 const state = {
   data: null,
   models: [],
   config: {},
-  filters: { q: "", model: "", tag: "", st: "" },
+  filters: { q: "", model: "", tag: "", network: "", st: "" },
   revealed: new Set(),   // 已显示密码的服务器 id
-  sec: REFRESH_SECS,
   fetching: false,
+  dragging: null,
+  sorting: false,
+  lastRefresh: 0,
+  lastRefreshAttempt: 0,
+  collecting: new Set(),
 };
+const pendingWrites = new Set();
+const requestCooldowns = new Map();
 
 /* ---------------- 工具 ---------------- */
 
@@ -26,6 +31,12 @@ function esc(s) {
 }
 
 async function api(path, method, body) {
+  if (Date.now() < (requestCooldowns.get(path) || 0)) throw new Error("操作过于频繁，请稍后再试");
+  const write = method && method !== "GET";
+  const key = `${method}:${path}`;
+  if (write && pendingWrites.has(key)) throw new Error("操作正在处理中，请勿重复提交");
+  if (write) pendingWrites.add(key);
+  try {
   const opts = { method: method || "GET", headers: {} };
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
@@ -34,8 +45,12 @@ async function api(path, method, body) {
   const res = await fetch(path, opts);
   let data = null;
   try { data = await res.json(); } catch (_) { /* 空响应 */ }
-  if (!res.ok) throw new Error((data && data.error) || `请求失败 (${res.status})`);
+  if (!res.ok) {
+    if (res.status === 429) requestCooldowns.set(path, Date.now() + (Number(res.headers.get("Retry-After")) || 5) * 1000);
+    throw new Error((data && data.error) || `请求失败 (${res.status})`);
+  }
   return data;
+  } finally { if (write) pendingWrites.delete(key); }
 }
 
 function fmtGB(mb) {
@@ -64,6 +79,9 @@ function toLocalInput(ts) {
 }
 
 function toast(msg, isErr) {
+  if ($$(".toast:not(.out)").some(el => el.textContent === msg)) return;
+  const existing = $$(".toast");
+  if (existing.length >= 3) existing[0].remove();
   const el = document.createElement("div");
   el.className = "toast" + (isErr ? " err" : "");
   el.textContent = msg;
@@ -96,7 +114,16 @@ function confirmBox(text, okLabel) {
     $("#cfText").textContent = text;
     $("#cfOk").textContent = okLabel || "确认";
     overlay.hidden = false;
-    const done = val => { overlay.hidden = true; resolve(val); };
+    let settled = false;
+    const onKey = e => { if (e.key === "Escape") { e.stopImmediatePropagation(); done(false); } };
+    const done = val => {
+      if (settled) return;
+      settled = true;
+      document.removeEventListener("keydown", onKey, true);
+      overlay.hidden = true;
+      resolve(val);
+    };
+    document.addEventListener("keydown", onKey, true);
     $("#cfOk").onclick = () => done(true);
     $("#cfCancel").onclick = () => done(false);
     overlay.onclick = e => { if (e.target === overlay) done(false); };
@@ -105,17 +132,25 @@ function confirmBox(text, okLabel) {
 
 /* ---------------- 数据获取 ---------------- */
 
-async function refresh() {
-  if (state.fetching) return;
+async function refresh(options = {}) {
+  if (state.fetching || state.dragging !== null || state.sorting) return;
+  const manual = options instanceof Event;
+  if (manual && Date.now() - state.lastRefreshAttempt < 5000) {
+    toast("刷新过于频繁，请间隔 5 秒再试", true);
+    return;
+  }
+  state.lastRefreshAttempt = Date.now();
   state.fetching = true;
+  $("#btnRefresh").disabled = true;
   try {
     state.data = await api("/api/dashboard");
     render();
+    state.lastRefresh = Date.now();
   } catch (e) {
     toast(`刷新失败:${e.message}`, true);
   } finally {
     state.fetching = false;
-    state.sec = REFRESH_SECS;
+    $("#btnRefresh").disabled = false;
   }
 }
 
@@ -153,32 +188,67 @@ function renderStats() {
 /* ---------------- 渲染:看板 ---------------- */
 
 function filteredServers() {
-  const { q, model, tag } = state.filters;
+  const { q, model, tag, network } = state.filters;
   const kw = q.trim().toLowerCase();
   return state.data.servers.filter(s =>
     (!kw || s.name.toLowerCase().includes(kw) || s.ip.toLowerCase().includes(kw))
     && (!model || s.model === model)
-    && (!tag || (s.tags || []).includes(tag)));
+    && (!tag || (s.tags || []).includes(tag))
+    && (!network || Object.entries(s.network_groups || {}).some(([kind, group]) => `${kind}:${group}` === network)));
+}
+
+function serverFamily(s) {
+  const model = (s.model || "").trim().toUpperCase();
+  return model.startsWith("A3") ? "A3" : model.startsWith("A5") ? "A5" : "其他";
+}
+
+function matchesServerState(s) {
+  const filter = state.filters.st;
+  return !filter || s.cards.some(c => c.state === filter)
+    || (filter === "offline" && s.status !== "online" && !s.cards.length);
 }
 
 function renderBoard() {
   const board = $("#board");
   const servers = filteredServers();
   const seen = new Set();
+  const positions = new Map();
+  const families = ["A5", "A3", "其他"];
+  families.forEach(family => {
+    let section = $(`[data-family="${family}"]`, board);
+    if (!section) {
+      section = document.createElement("section");
+      section.className = "machine-section";
+      section.dataset.family = family;
+      section.innerHTML = `<header class="machine-heading"><h2>${family === "其他" ? "其他 / 未标注型号" : family + " 服务器"}</h2><span class="machine-count"></span></header><div class="machine-grid"></div>`;
+      board.appendChild(section);
+    }
+  });
 
   servers.forEach((s, i) => {
     seen.add(s.id);
     let el = board.querySelector(`.server-card[data-sid="${s.id}"]`);
-    if (!el) { el = buildServerCard(s); board.appendChild(el); }
+    if (!el) el = buildServerCard(s);
+    const family = serverFamily(s);
+    const grid = $(`[data-family="${family}"] .machine-grid`, board);
+    const index = positions.get(family) || 0;
+    if (grid.children[index] !== el) grid.insertBefore(el, grid.children[index] || null);
+    positions.set(family, index + 1);
     updateServerCard(el, s, i);
   });
   $$(".server-card", board).forEach(el => {
     if (!seen.has(+el.dataset.sid)) el.remove();
   });
+  families.forEach(family => {
+    const section = $(`[data-family="${family}"]`, board);
+    const visible = $$(".server-card", section).filter(el => el.style.display !== "none");
+    section.hidden = !visible.length;
+    $(".machine-count", section).textContent = `${visible.length} 台 · 拖动 ⠿ 调整顺序`;
+  });
 
   // 空状态
   let empty = $(".empty", board);
-  if (servers.length) {
+  if (servers.some(matchesServerState)) {
     if (empty) empty.remove();
   } else {
     const hasAny = state.data.servers.length > 0;
@@ -211,6 +281,7 @@ function buildServerCard(s) {
   el.dataset.sid = s.id;
   el.innerHTML = `
     <div class="sc-head">
+      <span class="drag-handle" tabindex="0" role="button" aria-label="拖动排序，或按方向键移动" title="拖动调整位置；方向键也可调整">⠿</span>
       <span class="sc-dot"></span>
       <h3 class="sc-name"></h3>
       <span class="sc-model mono"></span>
@@ -236,6 +307,7 @@ function buildServerCard(s) {
       </span>
     </div>
     <div class="sc-sub"></div>
+    <div class="sc-networks"></div>
     <div class="sc-error" hidden></div>
     <div class="npu-wall"></div>`;
   const wall = $(".npu-wall", el);
@@ -270,14 +342,14 @@ function updateServerCard(el, s, i) {
   const tagsEl = $(".sc-tags", el);
   const tagsHtml = (s.tags || []).map(t => `<span class="tag-chip">${esc(t)}</span>`).join("");
   if (tagsEl.dataset.raw !== tagsHtml) { tagsEl.innerHTML = tagsHtml; tagsEl.dataset.raw = tagsHtml; }
+  const groups = Object.entries(s.network_groups || {});
+  $(".sc-networks", el).innerHTML = groups.length
+    ? groups.map(([kind, group]) => `<span class="network-chip" title="人工标记：同网络、同互通组才表示互通；不代表实时连通性检测">${esc(({uboe: "UBoE", roce: "RoCE", ubg: "UBG"})[kind] || kind)} <b>${esc(group)}</b></span>`).join("")
+    : `<span class="network-unknown">互通组未标注 · 相同网络类型不代表互通</span>`;
 
   $(".ip", el).textContent = s.collect_enabled ? `${s.ip}:${s.ssh_port}` : `${s.ip}:${s.ssh_port}(已停采)`;
   $(".user", el).textContent = `${s.username} /`;
-  const pwEl = $(".pw", el);
-  const revealed = state.revealed.has(s.id);
-  pwEl.innerHTML = revealed
-    ? `<span class="pw-real mono">${esc(s.password || "(空)")}</span>`
-    : `<span class="pw-mask">······</span>`;
+  updatePassword(el, s);
 
   // 采集状态行
   const sub = $(".sc-sub", el);
@@ -296,11 +368,11 @@ function updateServerCard(el, s, i) {
   // 操作按钮
   const btnCollect = $('[data-act="collect"]', el);
   btnCollect.innerHTML = ACTION_SVG.collect;
-  btnCollect.disabled = !s.collect_enabled;
+  btnCollect.disabled = state.collecting.has(s.id);
   const btnToggle = $('[data-act="toggle"]', el);
   btnToggle.innerHTML = s.collect_enabled
-    ? `<svg viewBox="0 0 16 16"><path d="M5.5 3.5v9l7-4.5z" fill="currentColor"/></svg>`
-    : `<svg viewBox="0 0 16 16"><rect x="4" y="3.5" width="2.6" height="9" rx="1" fill="currentColor"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="1" fill="currentColor"/></svg>`;
+    ? `<svg viewBox="0 0 16 16"><rect x="4" y="3.5" width="2.6" height="9" rx="1" fill="currentColor"/><rect x="9.4" y="3.5" width="2.6" height="9" rx="1" fill="currentColor"/></svg>`
+    : `<svg viewBox="0 0 16 16"><path d="M5.5 3.5v9l7-4.5z" fill="currentColor"/></svg>`;
   btnToggle.title = s.collect_enabled ? "停用定时采集" : "启用定时采集";
   const btnEdit = $('[data-act="edit"]', el); btnEdit.innerHTML = ACTION_SVG.edit;
   const btnDel = $('[data-act="delete"]', el); btnDel.innerHTML = ACTION_SVG.delete;
@@ -320,7 +392,17 @@ function updateServerCard(el, s, i) {
     if (show) visibleCount++;
   });
   $$(".tile", wall).forEach(t => { if (!seen.has(+t.dataset.npu)) t.remove(); });
-  el.style.display = (stFilter && visibleCount === 0) ? "none" : "";
+  el.style.display = matchesServerState(s) ? "" : "none";
+}
+
+function updatePassword(el, s) {
+  const pwEl = $(".pw", el);
+  const shown = state.revealed.has(s.id);
+  const html = shown ? `<span class="pw-real mono">${esc(s.password || "(空)")}</span>` : `<span class="pw-mask">······</span>`;
+  if (pwEl.innerHTML !== html) pwEl.innerHTML = html;
+  const button = $('[data-act="eye"]', el);
+  button.setAttribute("aria-pressed", String(shown));
+  button.title = shown ? "隐藏密码" : "查看密码";
 }
 
 function buildTile(c) {
@@ -486,6 +568,7 @@ function openTileModal(sid, npu) {
     } catch (err) { toast(err.message, true); }
   };
   openOverlay("#tileModal");
+  if (!c.occupancy) form.elements.user.focus();
 }
 
 /* ---------------- 服务器弹窗 ---------------- */
@@ -509,6 +592,7 @@ function openServerModal(server) {
     form.elements.username.value = server.username;
     form.elements.password.value = server.password;
     form.elements.tags.value = (server.tags || []).join(", ");
+    ["uboe", "roce", "ubg"].forEach(kind => { form.elements[kind].value = (server.network_groups || {})[kind] || ""; });
     form.elements.note.value = server.note || "";
     form.elements.collect_enabled.checked = server.collect_enabled;
     form.dataset.sid = server.id;
@@ -519,7 +603,7 @@ function openServerModal(server) {
     form.elements.collect_enabled.checked = true;
     delete form.dataset.sid;
   }
-  syncExpectedCards();
+  if (!server) syncExpectedCards();
   openOverlay("#serverModal");
   form.elements.name.focus();
 }
@@ -547,6 +631,7 @@ $("#serverForm").addEventListener("submit", async e => {
     password: fd.get("password") || "",
     tags: String(fd.get("tags") || "").split(",").map(t => t.trim()).filter(Boolean),
     note: fd.get("note") || "",
+    network_groups: Object.fromEntries(["uboe", "roce", "ubg"].map(kind => [kind, String(fd.get(kind) || "").trim()]).filter(([,group]) => group)),
     collect_enabled: form.elements.collect_enabled.checked,
   };
   try {
@@ -621,29 +706,17 @@ $("#settingsForm").addEventListener("submit", async e => {
 
 /* ---------------- 备份 ---------------- */
 
-$("#btnExport").addEventListener("click", async () => {
-  try {
-    const data = await api("/api/export");
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const a = document.createElement("a");
-    const d = new Date();
-    const p = n => String(n).padStart(2, "0");
-    a.href = URL.createObjectURL(blob);
-    a.download = `npu-台账备份-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    toast("已导出台账 JSON");
-  } catch (e) { toast(e.message, true); }
-});
-
 $("#importFile").addEventListener("change", async e => {
   const file = e.target.files[0];
   if (!file) return;
+  e.target.disabled = true;
   try {
-    const text = await file.text();
-    const payload = JSON.parse(text);
-    const res = await api("/api/import", "POST", payload);
-    toast(`导入完成:新增 ${res.added} 台,更新 ${res.updated} 台,恢复登记 ${res.occupancies} 条`);
+    const payload = new FormData();
+    payload.append("file", file);
+    const response = await fetch("/api/ledger/import", { method: "POST", body: payload });
+    const res = await response.json();
+    if (!response.ok) throw new Error(res.error || "导入失败");
+    toast(`导入完成:新增 ${res.added} 台,更新 ${res.updated} 台`);
     closeOverlay($("#backupModal"));
     loadConfig();
     refresh();
@@ -651,6 +724,7 @@ $("#importFile").addEventListener("change", async e => {
     toast(`导入失败:${err.message}`, true);
   } finally {
     e.target.value = "";
+    e.target.disabled = false;
   }
 });
 
@@ -664,8 +738,12 @@ $("#board").addEventListener("click", async e => {
   const s = state.data.servers.find(x => x.id === sid);
   if (!s) return;
   const act = actBtn.dataset.act;
+  let startedCollect = false;
   try {
     if (act === "collect") {
+      if (state.collecting.has(sid)) return;
+      state.collecting.add(sid);
+      startedCollect = true;
       actBtn.disabled = true;
       toast(`正在采集 ${s.name} …`);
       const res = await api(`/api/servers/${sid}/collect`, "POST");
@@ -686,12 +764,17 @@ $("#board").addEventListener("click", async e => {
       }
     } else if (act === "eye") {
       state.revealed.has(sid) ? state.revealed.delete(sid) : state.revealed.add(sid);
-      render();
+      updatePassword(card, s);
     } else if (act === "copypw") {
       await copyText(s.password || "", s.password ? "密码已复制" : "该服务器未填密码");
     }
   } catch (err) {
     toast(err.message, true);
+  } finally {
+    if (startedCollect) {
+      state.collecting.delete(sid);
+      actBtn.disabled = false;
+    }
   }
 });
 
@@ -701,6 +784,7 @@ function bindFilters() {
   $("#fSearch").addEventListener("input", e => { state.filters.q = e.target.value; renderBoard(); });
   $("#fModel").addEventListener("change", e => { state.filters.model = e.target.value; renderBoard(); });
   $("#fTag").addEventListener("change", e => { state.filters.tag = e.target.value; renderBoard(); });
+  $("#fNetwork").addEventListener("change", e => { state.filters.network = e.target.value; renderBoard(); });
   $("#fState").addEventListener("change", e => {
     state.filters.st = e.target.value;
     renderBoard();
@@ -724,6 +808,7 @@ function buildModelOptions() {
   sel.innerHTML = `<option value="">全部型号</option>` +
     [...models].map(m => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
   if ([...models].includes(cur)) sel.value = cur;
+  else state.filters.model = "";
 }
 
 function buildTagOptions(tags) {
@@ -734,24 +819,105 @@ function buildTagOptions(tags) {
   sel.innerHTML = `<option value="">全部组网</option>` +
     [...all].sort().map(t => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
   if ([...all].includes(cur)) sel.value = cur;
+  else state.filters.tag = "";
+}
+
+function buildNetworkOptions() {
+  const sel = $("#fNetwork");
+  const all = new Map();
+  (state.data?.servers || []).forEach(s => Object.entries(s.network_groups || {}).forEach(([kind, group]) => {
+    all.set(`${kind}:${group}`, `${({uboe: "UBoE", roce: "RoCE", ubg: "UBG"})[kind] || kind} / ${group}`);
+  }));
+  sel.innerHTML = `<option value="">全部互通组</option>` + [...all].sort((a,b) => a[1].localeCompare(b[1])).map(([key,label]) => `<option value="${esc(key)}">${esc(label)}</option>`).join("");
+  if (all.has(state.filters.network)) sel.value = state.filters.network;
+  else state.filters.network = "";
+}
+
+/* ---------------- 排序：全局保存，筛选时不丢失隐藏机器 ---------------- */
+
+async function moveServer(sid, targetId, after = false) {
+  if (state.sorting || sid === targetId) return;
+  const source = state.data.servers.find(s => s.id === sid);
+  const target = state.data.servers.find(s => s.id === targetId);
+  if (!source || !target || serverFamily(source) !== serverFamily(target)) return;
+  const ids = state.data.servers.map(s => s.id).filter(id => id !== sid);
+  ids.splice(ids.indexOf(targetId) + (after ? 1 : 0), 0, sid);
+  state.sorting = true;
+  try {
+    await api("/api/servers/order", "PUT", { ids });
+    const byId = new Map(state.data.servers.map(s => [s.id, s]));
+    state.data.servers = ids.map(id => byId.get(id));
+    renderBoard();
+    toast("机器顺序已保存");
+  } catch (e) { toast(e.message, true); }
+  finally { state.sorting = false; }
+}
+
+function bindSorting() {
+  const board = $("#board");
+  const clear = () => $$(".drop-before, .drop-after, .is-dragging", board).forEach(el => el.classList.remove("drop-before", "drop-after", "is-dragging"));
+  let pointer = null;
+  board.addEventListener("pointerdown", e => {
+    const handle = e.target.closest(".drag-handle");
+    if (!handle || state.sorting || e.button !== 0 || pointer) return;
+    const card = handle.closest(".server-card");
+    pointer = { id: e.pointerId, handle, card, x: e.clientX, y: e.clientY, target: null, after: false };
+    handle.setPointerCapture(e.pointerId);
+    handle.focus();
+    e.preventDefault();
+  });
+  board.addEventListener("pointermove", e => {
+    if (!pointer || e.pointerId !== pointer.id) return;
+    if (state.dragging === null && Math.hypot(e.clientX - pointer.x, e.clientY - pointer.y) < 6) return;
+    state.dragging = +pointer.card.dataset.sid;
+    pointer.card.classList.add("is-dragging");
+    e.preventDefault();
+    $$(".drop-before, .drop-after", board).forEach(el => el.classList.remove("drop-before", "drop-after"));
+    const card = document.elementFromPoint(e.clientX, e.clientY)?.closest(".server-card");
+    pointer.target = null;
+    if (!card || card === pointer.card || pointer.card.closest(".machine-section") !== card.closest(".machine-section")) return;
+    const box = card.getBoundingClientRect();
+    pointer.after = e.clientX > box.left + box.width / 2;
+    pointer.target = +card.dataset.sid;
+    card.classList.add(pointer.after ? "drop-after" : "drop-before");
+  });
+  const finish = (e, cancelled = false) => {
+    if (!pointer || e.pointerId !== pointer.id) return;
+    const { handle, target, after, id } = pointer;
+    const sid = state.dragging;
+    pointer = null;
+    state.dragging = null;
+    if (handle.hasPointerCapture(id)) handle.releasePointerCapture(id);
+    clear();
+    if (!cancelled && sid !== null && target !== null) moveServer(sid, target, after);
+  };
+  board.addEventListener("pointerup", e => finish(e));
+  board.addEventListener("pointercancel", e => finish(e, true));
+  board.addEventListener("lostpointercapture", e => finish(e, true));
+  board.addEventListener("keydown", async e => {
+    const handle = e.target.closest(".drag-handle");
+    if (!handle || !["ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"].includes(e.key)) return;
+    e.preventDefault();
+    const sid = +handle.closest(".server-card").dataset.sid;
+    const cards = $$(".server-card", handle.closest(".machine-section")).filter(el => el.style.display !== "none");
+    const next = ["ArrowDown", "ArrowRight"].includes(e.key);
+    const neighbor = cards[cards.findIndex(el => +el.dataset.sid === sid) + (next ? 1 : -1)];
+    if (neighbor) {
+      await moveServer(sid, +neighbor.dataset.sid, next);
+      $(`.server-card[data-sid="${sid}"] .drag-handle`, board)?.focus();
+    }
+  });
 }
 
 /* ---------------- 轮询 ---------------- */
 
 function startTicker() {
-  const arc = $("#refreshArc");
-  arc.style.strokeDasharray = RING_C;
   setInterval(() => {
-    if (document.hidden || !state.data) return;
-    state.sec--;
-    $("#refreshSec").textContent = Math.max(0, state.sec) + "s";
-    arc.style.strokeDashoffset = RING_C * (1 - Math.max(0, state.sec) / REFRESH_SECS);
-    if (state.sec <= 0) refresh();
-  }, 1000);
-  document.addEventListener("visibilitychange", () => {
     if (!document.hidden) refresh();
+  }, REFRESH_SECS * 1000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && Date.now() - state.lastRefresh >= REFRESH_SECS * 1000) refresh();
   });
-  $("#refreshBox").addEventListener("click", refresh);
 }
 
 /* ---------------- 全局按钮 / 弹窗关闭 ---------------- */
@@ -759,12 +925,18 @@ function startTicker() {
 function bindGlobal() {
   $("#btnAddServer").addEventListener("click", () => openServerModal(null));
   $("#btnSettings").addEventListener("click", openSettingsModal);
+  $("#btnRefresh").addEventListener("click", refresh);
   $("#btnBackup").addEventListener("click", () => openOverlay("#backupModal"));
   $("#btnCollect").addEventListener("click", async () => {
+    const button = $("#btnCollect");
+    button.disabled = true;
     try {
       await api("/api/collect", "POST");
-      toast("已触发全量采集,稍后自动刷新");
+      toast("已触发全量采集，完成后可点击刷新看板");
+      setTimeout(refresh, 10000);
+      setTimeout(refresh, 30000);
     } catch (e) { toast(e.message, true); }
+    finally { setTimeout(() => { button.disabled = false; }, 30000); }
   });
   $("#smModel").addEventListener("change", syncExpectedCards);
 
@@ -786,15 +958,17 @@ function bindGlobal() {
 /* ---------------- 入口 ---------------- */
 
 function render() {
-  renderStats();
-  renderBoard();
+  buildNetworkOptions();
   buildModelOptions();
   buildTagOptions();
+  renderStats();
+  renderBoard();
 }
 
 async function init() {
   bindFilters();
   bindGlobal();
+  bindSorting();
   await loadConfig();
   await refresh();
   startTicker();

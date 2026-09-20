@@ -23,7 +23,7 @@ DEFAULT_MODELS = [
 ]
 
 DEFAULT_CONFIG = {
-    "interval_seconds": "60",       # 定时采集间隔(秒)
+    "interval_seconds": "1800",     # 定时采集间隔(秒)，默认 30 分钟
     "aicore_threshold": "20",       # AI Core 利用率超过该值视为"在跑"
     "hbm_threshold_pct": "10",      # HBM 已用百分比超过该值视为"在跑"
     "ssh_connect_timeout": "8",
@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS server (
   password        TEXT NOT NULL DEFAULT '',
   note            TEXT NOT NULL DEFAULT '',
   tags            TEXT NOT NULL DEFAULT '',        -- 逗号分隔,如 "roce,双平面"
+  network_groups  TEXT NOT NULL DEFAULT '{}',      -- 各网络独立互通组，仅为人工标记
+  sort_order      INTEGER NOT NULL DEFAULT 0,
   expected_cards  INTEGER,                         -- 台账预设卡数,展示以采集为准
   collect_enabled INTEGER NOT NULL DEFAULT 1,
   created_at      INTEGER NOT NULL,
@@ -105,6 +107,12 @@ def init_db() -> None:
     conn = get_conn()
     with conn:
         conn.executescript(SCHEMA)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(server)")}
+        if "network_groups" not in columns:
+            conn.execute("ALTER TABLE server ADD COLUMN network_groups TEXT NOT NULL DEFAULT '{}'")
+        if "sort_order" not in columns:
+            conn.execute("ALTER TABLE server ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE server SET sort_order = id")
         for key, value in DEFAULT_CONFIG.items():
             conn.execute(
                 "INSERT OR IGNORE INTO config(key, value) VALUES(?, ?)", (key, value)
@@ -151,7 +159,7 @@ def get_models() -> list:
 # ---------------------------------------------------------------- 服务器台账
 
 SERVER_FIELDS = ("name", "model", "ip", "ssh_port", "username", "password",
-                 "note", "tags", "expected_cards", "collect_enabled")
+                 "note", "tags", "expected_cards", "collect_enabled", "network_groups")
 
 
 def _split_tags(raw: str) -> list:
@@ -162,11 +170,12 @@ def _server_to_dict(row) -> dict:
     d = dict(row)
     d["tags"] = _split_tags(d.get("tags", ""))
     d["collect_enabled"] = bool(d.get("collect_enabled"))
+    d["network_groups"] = json.loads(d.get("network_groups") or "{}")
     return d
 
 
 def list_servers() -> list:
-    rows = get_conn().execute("SELECT * FROM server ORDER BY name").fetchall()
+    rows = get_conn().execute("SELECT * FROM server ORDER BY sort_order, id").fetchall()
     return [_server_to_dict(r) for r in rows]
 
 
@@ -186,13 +195,14 @@ def create_server(data: dict) -> dict:
     with conn:
         cur = conn.execute(
             "INSERT INTO server(name, model, ip, ssh_port, username, password, note, tags,"
-            " expected_cards, collect_enabled, created_at, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            " expected_cards, collect_enabled, created_at, updated_at, network_groups, sort_order)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, (SELECT COALESCE(MAX(sort_order),0)+1 FROM server))",
             (data.get("name", "").strip(), data.get("model", ""), data.get("ip", "").strip(),
              int(data.get("ssh_port") or 22), data.get("username") or "root",
              data.get("password") or "", data.get("note") or "",
              ",".join(data.get("tags") or []), data.get("expected_cards"),
-             1 if data.get("collect_enabled", True) else 0, now, now),
+             1 if data.get("collect_enabled", True) else 0, now, now,
+             json.dumps(data.get("network_groups") or {}, ensure_ascii=False)),
         )
         server_id = cur.lastrowid
     return get_server(server_id)
@@ -204,6 +214,8 @@ def update_server(server_id: int, data: dict) -> dict | None:
         return get_server(server_id)
     if "tags" in fields:
         fields["tags"] = ",".join(fields["tags"] or [])
+    if "network_groups" in fields:
+        fields["network_groups"] = json.dumps(fields["network_groups"] or {}, ensure_ascii=False)
     sets = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [int(time.time()), server_id]
     conn = get_conn()
@@ -216,6 +228,53 @@ def delete_server(server_id: int) -> None:
     conn = get_conn()
     with conn:
         conn.execute("DELETE FROM server WHERE id = ?", (server_id,))
+
+
+def reorder_servers(ids: list[int]) -> None:
+    """所有服务器的排序原子保存；拒绝过时或包含重复 ID 的请求。"""
+    conn = get_conn()
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = {r[0] for r in conn.execute("SELECT id FROM server")}
+        if len(ids) != len(existing) or set(ids) != existing:
+            raise ValueError("服务器列表已变化，请刷新后重新排序")
+        conn.executemany("UPDATE server SET sort_order = ? WHERE id = ?",
+                         [(i, sid) for i, sid in enumerate(ids)])
+
+
+def import_server_rows(rows: list[dict]) -> dict:
+    """已验证 CSV 台账全量原子导入；可选字段留空时不覆盖已有值。"""
+    conn = get_conn()
+    added = updated = 0
+    now = int(time.time())
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = {r["name"]: r["id"] for r in conn.execute("SELECT id,name FROM server")}
+        order = conn.execute("SELECT COALESCE(MAX(sort_order),0) FROM server").fetchone()[0]
+        for item in rows:
+            fields = {k: v for k, v in item.items() if k in SERVER_FIELDS}
+            if "tags" in fields:
+                fields["tags"] = ",".join(fields["tags"])
+            if "network_groups" in fields:
+                if item["name"] in existing:
+                    old = conn.execute("SELECT network_groups FROM server WHERE id = ?",
+                                       (existing[item["name"]],)).fetchone()[0]
+                    fields["network_groups"] = {**json.loads(old), **fields["network_groups"]}
+                fields["network_groups"] = json.dumps(fields["network_groups"], ensure_ascii=False)
+            if item["name"] in existing:
+                sets = ",".join(f"{k} = ?" for k in fields)
+                conn.execute(f"UPDATE server SET {sets},updated_at = ? WHERE id = ?",
+                             [*fields.values(), now, existing[item["name"]]])
+                updated += 1
+            else:
+                order += 1
+                fields.update(created_at=now, updated_at=now, sort_order=order)
+                keys = ",".join(fields)
+                placeholders = ",".join("?" for _ in fields)
+                cur = conn.execute(f"INSERT INTO server({keys}) VALUES({placeholders})", list(fields.values()))
+                existing[item["name"]] = cur.lastrowid
+                added += 1
+    return {"added": added, "updated": updated}
 
 
 def all_tags() -> list:
@@ -234,28 +293,46 @@ def replace_cards(server_id: int, cards: list, ts: int) -> None:
     """一轮采集成功后,整体替换该服务器的卡快照(不保留历史)。"""
     conn = get_conn()
     with conn:
-        conn.execute("DELETE FROM card WHERE server_id = ?", (server_id,))
-        conn.executemany(
-            "INSERT INTO card(server_id, npu_id, chip_name, health, aicore_pct,"
-            " hbm_used_mb, hbm_total_mb, power_w, temp_c, updated_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?)",
-            [(server_id, c["npu_id"], c.get("chip_name"), c.get("health"),
-              c.get("aicore_pct"), c.get("hbm_used_mb"), c.get("hbm_total_mb"),
-              c.get("power_w"), c.get("temp_c"), ts) for c in cards],
-        )
+        _replace_cards(conn, server_id, cards, ts)
+
+
+def _replace_cards(conn, server_id: int, cards: list, ts: int) -> None:
+    conn.execute("DELETE FROM card WHERE server_id = ?", (server_id,))
+    conn.executemany(
+        "INSERT INTO card(server_id, npu_id, chip_name, health, aicore_pct,"
+        " hbm_used_mb, hbm_total_mb, power_w, temp_c, updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+        [(server_id, c["npu_id"], c.get("chip_name"), c.get("health"),
+          c.get("aicore_pct"), c.get("hbm_used_mb"), c.get("hbm_total_mb"),
+          c.get("power_w"), c.get("temp_c"), ts) for c in cards],
+    )
 
 
 def set_collect_result(server_id: int, ok: bool, error: str | None,
                        version: str | None = None) -> None:
-    status = "online" if ok else "offline"
     conn = get_conn()
     with conn:
-        conn.execute(
-            "UPDATE server SET status = ?, last_error = ?, last_collect_ts = ?,"
-            " npu_smi_version = COALESCE(?, npu_smi_version) WHERE id = ?",
-            (status, None if ok else (error or "未知错误")[:500],
-             int(time.time()), version, server_id),
-        )
+        _set_collect_result(conn, server_id, ok, error, version)
+
+
+def _set_collect_result(conn, server_id, ok, error, version):
+    status = "online" if ok else "offline"
+    conn.execute(
+        "UPDATE server SET status = ?, last_error = ?, last_collect_ts = ?,"
+        " npu_smi_version = COALESCE(?, npu_smi_version) WHERE id = ?",
+        (status, None if ok else (error or "未知错误")[:500],
+         int(time.time()), version, server_id),
+    )
+
+
+def save_collect_result(server_id: int, result: dict) -> None:
+    """状态和快照原子提交，快照失败时不能留下虚假的 online 状态。"""
+    conn = get_conn()
+    with conn:
+        _set_collect_result(conn, server_id, result["ok"], result.get("error"),
+                            result.get("version"))
+        if result["ok"]:
+            _replace_cards(conn, server_id, result["cards"], int(time.time()))
 
 
 # ---------------------------------------------------------------- 占用登记
@@ -327,9 +404,9 @@ def build_dashboard() -> dict:
     except ValueError:
         hbm_thr_pct = 10.0
     try:
-        interval = int(cfg.get("interval_seconds", 60))
+        interval = int(cfg.get("interval_seconds", 1800))
     except ValueError:
-        interval = 60
+        interval = 1800
 
     servers = list_servers()
     actives = active_occupancies()

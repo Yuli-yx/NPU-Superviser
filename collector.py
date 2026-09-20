@@ -6,7 +6,7 @@
 - 按 "|" 切列,行分类:第 3 列为纯字母(OK/Warning/...) => 卡行,否则为 chip 行;
 - HBM 的 used/total 取 chip 行上最后一个 "x / y" 数对(新格式);
   若 chip 行没有,回退取卡行上的数对(老 910 格式 HBM-Usage 在第一行);
-- 多 chip(多 die)聚合:AICore 取 max,HBM used/total 求和;
+- 带 Phy-ID 的输出按 die 展示，以物理设备编号作为卡号；其他格式保留 NPU 聚合;
 - 结构化解析失败时退化为纯正则逐行配对,仍失败则报 parse_error(带原始输出)。
 """
 import re
@@ -15,6 +15,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import db
+
+_collect_locks = {}
+_collect_locks_guard = threading.Lock()
+
+
+class CollectionInProgress(Exception):
+    pass
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
@@ -55,6 +62,8 @@ def parse_npu_smi(text: str) -> dict:
         version = m.group(1)
 
     cards = []
+    by_npu = {}
+    per_die = bool(re.search(r"\bPhy-ID\b", text, re.IGNORECASE))
     cur = None
 
     def close(card):
@@ -81,15 +90,28 @@ def parse_npu_smi(text: str) -> dict:
                 row = (int(toks[0]), " ".join(toks[1:]) or None, parts[1],
                        " ".join(parts[2:]))
         if row:
-            close(cur)
             npu_id, chip_name, health, tail = row
-            nums = NUM_RE.findall(tail)
+            # Phy-ID 格式每个 die 独立展示；旧格式仍按 NPU 聚合。
+            nums = tail.split()
+            power = _num(nums[0]) if nums else None
+            temp = _num(nums[1]) if len(nums) > 1 else None
+            if not per_die and npu_id in by_npu:
+                cur = by_npu[npu_id]
+                if health not in ("OK", "NA"):
+                    cur["health"] = health
+                if power is not None:
+                    cur["power_w"] = (cur["power_w"] or 0) + power
+                if temp is not None:
+                    cur["temp_c"] = max(cur["temp_c"], temp) if cur["temp_c"] is not None else temp
+                continue
             cur = {
                 "npu_id": npu_id, "chip_name": chip_name, "health": health,
-                "power_w": float(nums[0]) if len(nums) >= 1 else None,
-                "temp_c": float(nums[1]) if len(nums) >= 2 else None,
+                "power_w": power,
+                "temp_c": temp,
                 "_card_pair": None, "_chips": [],
             }
+            if not per_die:
+                by_npu[npu_id] = cur
             pm = PAIR_RE.search(tail)
             if pm:
                 cur["_card_pair"] = (int(pm.group(1)), int(pm.group(2)))
@@ -104,11 +126,22 @@ def parse_npu_smi(text: str) -> dict:
                 tail = " ".join(parts[2:])
             if tail is not None:
                 pairs = PAIR_RE.findall(tail)
-                cur["_chips"].append({
+                chip = {
                     "aicore_pct": _num(tail),
                     "pair": (int(pairs[-1][0]), int(pairs[-1][1])) if pairs else None,
-                })
-    close(cur)
+                }
+                if per_die:
+                    # 同格布局为 "Chip Phy-ID"，分列布局分别占前两列。
+                    ids = parts[0].split() if len(parts) < 4 or not _is_busid(parts[2]) else [parts[0], parts[1]]
+                    if len(ids) != 2 or not ids[1].isdigit():
+                        return {"version": version, "cards": [], "parse_error": True,
+                                "raw": "无法解析 die 的 Phy-ID: " + line[:400]}
+                    die = dict(cur, npu_id=int(ids[1]), _chips=[chip])
+                    close(die)
+                else:
+                    cur["_chips"].append(chip)
+    for card in by_npu.values():
+        close(card)
 
     if cards:
         return {"version": version, "cards": cards, "parse_error": False, "raw": None}
@@ -204,10 +237,7 @@ def collect_one(server: dict, connect_timeout: float = 8, exec_timeout: float = 
 
 def persist_result(server_id: int, result: dict) -> dict:
     """把一次采集结果写库(成功更新卡快照,失败只记状态)。"""
-    db.set_collect_result(server_id, result["ok"], result.get("error"),
-                          result.get("version"))
-    if result["ok"]:
-        db.replace_cards(server_id, result["cards"], int(time.time()))
+    db.save_collect_result(server_id, result)
     return result
 
 
@@ -216,12 +246,19 @@ def collect_server_now(server_id: int) -> dict:
     server = db.get_server(server_id)
     if not server:
         return {"ok": False, "error": "服务器不存在"}
-    result = collect_one(
-        server,
-        connect_timeout=db.get_config_int("ssh_connect_timeout", 8),
-        exec_timeout=db.get_config_int("ssh_exec_timeout", 20),
-    )
-    return persist_result(server_id, result)
+    with _collect_locks_guard:
+        lock = _collect_locks.setdefault(server_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise CollectionInProgress("该服务器正在采集中，请勿重复触发")
+    try:
+        result = collect_one(
+            server,
+            connect_timeout=db.get_config_int("ssh_connect_timeout", 8),
+            exec_timeout=db.get_config_int("ssh_exec_timeout", 20),
+        )
+        return persist_result(server_id, result)
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------- 定时线程
@@ -237,8 +274,9 @@ class Collector:
         self._pool = None
 
     def start(self):
+        self._workers = db.get_config_int("collect_workers", 8)
         self._pool = ThreadPoolExecutor(
-            max_workers=db.get_config_int("collect_workers", 8),
+            max_workers=self._workers,
             thread_name_prefix="npu-collect")
         self._thread = threading.Thread(target=self._loop, name="npu-scheduler",
                                         daemon=True)
@@ -260,7 +298,7 @@ class Collector:
                 self.run_round()
             except Exception as e:  # 单轮异常不能杀死调度线程
                 print(f"[collector] 采集轮异常: {e}")
-            interval = db.get_config_int("interval_seconds", 60)
+            interval = db.get_config_int("interval_seconds", 1800)
             self._wake.wait(max(5, interval))
             self._wake.clear()
 
@@ -271,16 +309,20 @@ class Collector:
             servers = [s for s in db.list_servers() if s["collect_enabled"]]
             if not servers:
                 return
-            connect_timeout = db.get_config_int("ssh_connect_timeout", 8)
-            exec_timeout = db.get_config_int("ssh_exec_timeout", 20)
-            futures = {self._pool.submit(collect_one, s, connect_timeout, exec_timeout): s
+            workers = db.get_config_int("collect_workers", 8)
+            if workers != self._workers:
+                self._pool.shutdown(wait=True)
+                self._workers = workers
+                self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="npu-collect")
+            futures = {self._pool.submit(collect_server_now, s["id"]): s
                        for s in servers}
             for fut, server in futures.items():
-                result = fut.result()
                 try:
-                    persist_result(server["id"], result)
+                    fut.result()
+                except CollectionInProgress:
+                    continue  # 手动采集已在进行，不能把服务器标为离线
                 except Exception as e:
-                    print(f"[collector] 写库失败 {server['name']}: {e}")
+                    print(f"[collector] 采集/写库失败 {server['name']}: {e}")
         finally:
             self._round_lock.release()
 

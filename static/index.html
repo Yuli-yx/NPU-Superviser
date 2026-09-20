@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NPU 资源看板</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='7' y='7' width='18' height='18' rx='4' fill='%230D9488'/%3E%3Crect x='11' y='11' width='10' height='10' rx='2' fill='white'/%3E%3Crect x='13' y='2' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='17' y='2' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='13' y='26' width='2' height='4' rx='1' fill='%230D9488'/%3E%3Crect x='17' y='26' width='2' height='4' rx='1' fill='%230D9488'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260918-3">
 </head>
 <body>
 
@@ -31,13 +31,6 @@
 
   <div class="stats" id="stats" aria-label="资源汇总"></div>
 
-  <div class="refresh" id="refreshBox" title="自动刷新倒计时,点击立即刷新">
-    <svg viewBox="0 0 36 36" class="refresh-ring" aria-hidden="true">
-      <circle class="rr-bg" cx="18" cy="18" r="15.5"/>
-      <circle class="rr-fg" id="refreshArc" cx="18" cy="18" r="15.5"/>
-    </svg>
-    <span class="refresh-label mono" id="refreshSec">10s</span>
-  </div>
 </header>
 
 <div class="toolbar">
@@ -48,6 +41,7 @@
     </label>
     <select id="fModel" aria-label="按型号筛选"><option value="">全部型号</option></select>
     <select id="fTag" aria-label="按组网标签筛选"><option value="">全部组网</option></select>
+    <select id="fNetwork" aria-label="按网络互通组筛选"><option value="">全部互通组</option></select>
     <select id="fState" aria-label="按状态筛选">
       <option value="">全部状态</option>
       <option value="idle">空闲</option>
@@ -57,13 +51,14 @@
     </select>
   </div>
   <div class="actions">
+    <button class="btn ghost" id="btnRefresh" title="重新读取看板，不触发 SSH 采集">刷新看板</button>
     <button class="btn ghost" id="btnCollect" title="立即开始一轮采集">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M13.7 1.8v3h-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
       立即采集
     </button>
-    <button class="btn ghost" id="btnBackup" title="导出 / 导入台账备份">
+    <button class="btn ghost" id="btnBackup" title="用 CSV 批量导入 / 导出服务器台账">
       <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0L5 7m3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11.5v1a1.5 1.5 0 0 0 1.5 1.5h8a1.5 1.5 0 0 0 1.5-1.5v-1" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-      备份
+      台账导入 / 导出
     </button>
     <button class="btn ghost" id="btnSettings" title="采集与阈值设置">
       <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
@@ -81,7 +76,7 @@
   <span class="legend-item"><i class="dot occupied"></i>已占用</span>
   <span class="legend-item"><i class="dot busy"></i>在跑 · 未登记</span>
   <span class="legend-item"><i class="dot offline"></i>离线 / 无数据</span>
-  <span class="legend-hint">点击卡格可登记 / 释放占用</span>
+  <span class="legend-hint">每 30 分钟自动更新 · 点击卡格登记占用 · 互通组为人工标记</span>
 </div>
 
 <main class="board" id="board"></main>
@@ -105,6 +100,10 @@
         <label class="field"><span>SSH 用户名</span><input name="username" value="root"></label>
         <label class="field"><span>SSH 密码</span><input name="password" type="text" autocomplete="off" placeholder="用于采集与展示"></label>
         <label class="field span2"><span>组网标签(逗号分隔)</span><input name="tags" placeholder="如: RoCE, 参数面, 训练组"></label>
+        <p class="field span2 network-help">相同网络类型不代表互通。每种网络独立填写组名，同网络、同组名表示互通；未知时留空。</p>
+        <label class="field"><span>UBoE 互通组</span><input name="uboe" maxlength="60" placeholder="如 126-129"></label>
+        <label class="field"><span>RoCE 互通组</span><input name="roce" maxlength="60" placeholder="如 RoCE-机柜A"></label>
+        <label class="field"><span>UBG 互通组</span><input name="ubg" maxlength="60" placeholder="如 UBG-训练域1"></label>
         <label class="field span2"><span>备注</span><input name="note" maxlength="200" placeholder="机房位置、负责人等(可选)"></label>
       </div>
       <label class="check-field"><input type="checkbox" name="collect_enabled" checked> 启用定时采集</label>
@@ -176,23 +175,25 @@
 <div class="overlay" id="backupModal" hidden>
   <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="bkTitle">
     <header class="modal-head">
-      <h2 id="bkTitle">台账备份</h2>
+      <h2 id="bkTitle">台账导入 / 导出</h2>
       <button class="icon-btn" data-close aria-label="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></button>
     </header>
     <div class="modal-body">
-      <p class="bk-desc">导出内容包含服务器台账(含 SSH 密码)、生效中的占用登记与型号配置。JSON 文件请妥善保管。</p>
+      <p class="bk-desc">下载 CSV 模板，用 Excel 填写并另存为「CSV UTF-8」。列名中列出当前型号选项、已有互通组及填写规则。仅 IP 必填，名称留空时取 IP；型号按列名选项填写，新型号请先在设置中添加。</p>
       <div class="bk-actions">
-        <button class="btn ghost" id="btnExport">
+        <a class="btn ghost" href="/api/ledger.csv?template=1" download>下载空模板</a>
+        <a class="btn ghost" id="btnExport" href="/api/ledger.csv" download>
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 11V3m0 0L5 6m3-3 3 3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-          导出 JSON
-        </button>
+          导出台账 CSV
+        </a>
         <label class="btn ghost file-btn">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v8m0 0L5 8m3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M2.5 11v1.5A1.5 1.5 0 0 0 4 14h8a1.5 1.5 0 0 0 1.5-1.5V11" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-          导入 JSON
-          <input type="file" id="importFile" accept=".json,application/json" hidden>
+          导入 CSV
+          <input type="file" id="importFile" accept=".csv,text/csv" hidden>
         </label>
       </div>
-      <p class="bk-note">导入按「名称」匹配:已存在则更新,不存在则新增;已有生效登记的卡会跳过,不会重复登记。</p>
+      <p class="bk-note">按名称匹配：已存在则更新，否则新增。可选字段留空时保留已有值；新机器默认 SSH 端口 22、用户名 root、启用采集。密码可按需要填写。</p>
+      <p class="bk-note">CSV 仅包含服务器台账（含密码），不包含占用登记或型号配置，请妥善保管。编辑页面可清除已有互通组。</p>
     </div>
   </div>
 </div>
@@ -213,6 +214,6 @@
 <div class="toasts" id="toasts" aria-live="polite"></div>
 <div class="tooltip mono" id="tooltip" hidden></div>
 
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260918-3"></script>
 </body>
 </html>
