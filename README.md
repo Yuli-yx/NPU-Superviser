@@ -3,6 +3,9 @@
 开发组内部用的局域网网页:自动采集每台服务器上 `npu-smi info` 的卡状态
 (AI Core 利用率 / HBM 显存 / 功耗 / 温度),手动登记卡的占用,查看服务器 SSH 账号密码。
 
+<img width="992" height="1301" alt="image" src="https://github.com/user-attachments/assets/0fa164c2-1ace-4205-a640-176de03f2111" />
+
+
 ## 功能
 
 - **看板**:每台服务器一张卡片,每张 NPU 一个彩色卡格 — 空闲(青绿)/ 已占用(洋红)/
